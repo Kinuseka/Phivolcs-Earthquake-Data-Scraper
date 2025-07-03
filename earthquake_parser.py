@@ -12,42 +12,90 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 BASE_URL = "https://earthquake.phivolcs.dost.gov.ph/"
 MONTHLY_URL_PATTERN = "https://earthquake.phivolcs.dost.gov.ph/EQLatest-Monthly/{year}/{year}_{month}.html"
 
+# Pre-compiled regex patterns for location parsing (readability + performance)
+PRIMARY_LOC_PATTERN = re.compile(r'(\d+)\s*km\s+([NS])\s*(\d+)Â°?\s*([EW])\s+of\s+(.+?)(?:\s*\(([^)]+)\))?$', re.IGNORECASE)
+ALT_DIST_DIR_PATTERN = re.compile(r'\d+\s*km\s+(?:north|south|east|west|northeast|northwest|southeast|southwest)\s+of\s+(.+?)(?:\s*\(([^)]+)\))?$', re.IGNORECASE)
+PAREN_PATTERN = re.compile(r'^(.+?)\s*\(([^)]+)\)$')
+COMMA_PATTERN = re.compile(r'^([^,]+),\s*(.+)$')
+PREFIX_STRIP_PATTERN = re.compile(r'^\d+\s*km\s+[^o]+of\s+', re.IGNORECASE)
+COORD_PATTERN = re.compile(r'\s*\(?\s*[-+]?\d+\.?\d*\s*,\s*[-+]?\d+\.?\d*\s*\)?', re.IGNORECASE)
+
 def clean_text(text: str) -> str:
     if not text:
         return ""
     return re.sub(r'\s+', ' ', text.strip())
 
+def _extract_place_province(text: str) -> Tuple[str, str]:
+    """Return (place_name, province) from a raw location string using fallback patterns."""
+    match = ALT_DIST_DIR_PATTERN.search(text)
+    if match:
+        full_place = match.group(1).strip()
+        province_from_paren = match.group(2).strip() if match.group(2) else ""
+        
+        if province_from_paren:
+            place_name = f"{full_place} ({province_from_paren})"
+            province = province_from_paren
+        else:
+            place_name = full_place
+            province = ""
+        
+        return _clean_coordinates_from_place(place_name), province
+
+    match = PAREN_PATTERN.match(text)
+    if match:
+        place_without_paren = match.group(1).strip()
+        province_from_paren = match.group(2).strip()
+        place_name = f"{place_without_paren} ({province_from_paren})"
+        return _clean_coordinates_from_place(place_name), province_from_paren
+
+    match = COMMA_PATTERN.match(text)
+    if match:
+        place = match.group(1).strip()
+        province = match.group(2).strip()
+        place_name = _clean_coordinates_from_place(place)
+        return place_name, province
+
+    place = PREFIX_STRIP_PATTERN.sub('', text).strip() or text
+    return _clean_coordinates_from_place(place), ""
+
+def _clean_coordinates_from_place(place: str) -> str:
+    """Remove coordinate patterns from place name."""
+    cleaned = COORD_PATTERN.sub('', place).strip()
+    return cleaned if cleaned else place
+
 def parse_location(location_text: str) -> Dict[str, str]:
     location_text = clean_text(location_text)
-    
-    pattern = r'(\d+)\s*km\s+([NS])\s*(\d+)°?\s*([EW])\s+of\s+(.+?)(?:\s*\(([^)]+)\))?$'
-    match = re.search(pattern, location_text)
-    
+
+    match = PRIMARY_LOC_PATTERN.search(location_text)
     if match:
-        distance = match.group(1)
-        ns_direction = match.group(2)
-        degree = match.group(3)
-        ew_direction = match.group(4)
-        place = match.group(5).strip()
-        province = match.group(6).strip() if match.group(6) else ""
+        distance, ns_dir, degree, ew_dir, place_part, province_part = match.groups()
+        province = province_part.strip() if province_part else ""
+        place_base = place_part.strip()
+        
+        if province:
+            place_name = f"{place_base} ({province})"
+        else:
+            place_name = place_base
+            
+        place_name = _clean_coordinates_from_place(place_name)
         
         return {
             "raw_location": location_text,
             "distance_km": distance,
-            "direction": f"{ns_direction} {degree}° {ew_direction}",
-            "place_name": place,
+            "direction": f"{ns_dir} {degree}° {ew_dir}",
+            "place_name": place_name,
             "province": province,
-            "full_location": f"{place}, {province}" if province else place
         }
-    else:
-        return {
-            "raw_location": location_text,
-            "distance_km": "",
-            "direction": "",
-            "place_name": location_text,
-            "province": "",
-            "full_location": location_text
-        }
+
+    # Fallback extraction when primary pattern fails
+    place_name, province = _extract_place_province(location_text)
+    return {
+        "raw_location": location_text,
+        "distance_km": "",
+        "direction": "",
+        "place_name": place_name,
+        "province": province,
+    }
 
 def get_browser_headers() -> Dict[str, str]:
     return {
@@ -202,8 +250,7 @@ def parse_earthquake_data(source: str) -> Dict[str, Any]:
                 "direction": location_data["direction"],
                 "place_name": location_data["place_name"],
                 "province": location_data["province"],
-                "full_location": location_data["full_location"],
-                "location_with_coordinates": f"{location_data['full_location']} ({latitude}, {longitude})"
+                "location_with_coordinates": f"{location_data['place_name']} ({latitude}, {longitude})"
             }
             
             earthquakes.append(earthquake)
@@ -227,7 +274,6 @@ def parse_earthquake_data(source: str) -> Dict[str, Any]:
                 "direction",
                 "place_name",
                 "province",
-                "full_location",
                 "location_with_coordinates"
             ]
         },
@@ -366,7 +412,7 @@ def main():
         if earthquake_data['earthquakes']:
             print(f"\n[DATA] Sample earthquake data:")
             for i, eq in enumerate(earthquake_data['earthquakes'][:3]):
-                print(f"{i+1}. {eq['date_time']} | Mag: {eq['magnitude']} | {eq['full_location']} | Coords: {eq['coordinates_string']}")
+                print(f"{i+1}. {eq['date_time']} | Mag: {eq['magnitude']} | {eq['place_name']} | Coords: {eq['coordinates_string']}")
         
     except requests.RequestException as e:
         print(f"[ERROR] Network error: {e}")
